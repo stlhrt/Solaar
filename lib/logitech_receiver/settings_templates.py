@@ -42,7 +42,6 @@ from .settings import BooleanValidator as _BooleanV
 from .settings import ChoicesMapValidator as _ChoicesMapV
 from .settings import ChoicesValidator as _ChoicesV
 from .settings import FeatureRW as _FeatureRW
-from .settings import FeatureRWMap as _FeatureRWMap
 from .settings import LongSettings as _LongSettings
 from .settings import MultipleRangeValidator as _MultipleRangeV
 from .settings import RangeValidator as _RangeV
@@ -114,6 +113,8 @@ _MOUSE_GESTURES = ('mouse-gestures', _('Mouse Gestures'),
                    _('Send a gesture by sliding the mouse while holding the button down.'))
 _DIVERT_CROWN = ('divert-crown', _('Divert crown events'),
                  _('Make crown send CROWN HID++ notifications (which trigger Solaar rules but are otherwise ignored).'))
+_CROWN_SMOOTH = ('crown-smooth', _('Crown smooth scroll'),
+                 _('Set crown smooth scroll'))
 _DIVERT_GKEYS = ('divert-gkeys', _('Divert G Keys'),
                  _('Make G keys send GKEY HID++ notifications (which trigger Solaar rules but are otherwise ignored).'))
 _SPEED_CHANGE = ('speed-change', _('Sensitivity Switching'),
@@ -224,13 +225,17 @@ _DISABLE_KEYS_LABEL_SUB = _('Disables the %s key.')
 # _FeatureRW is for feature-based settings and takes the feature name as positional argument plus the following:
 #   read_fnid is the feature function (times 16) to read the value (default 0x00),
 #   write_fnid is the feature function (times 16) to write the value (default 0x10),
+#   prefix is a prefix to add to the data being written and the read request (default b''), used for features
+#     that provide and set multiple settings (e.g., to read and write function key inversion for current host)
 #   no_reply is whether to wait for a reply (default false) (USE WITH EXTREME CAUTION).
 #
 # There are three simple validators - _BooleanV, _RangeV, and _ChoicesV
-# _BooleanV is for boolean values.  It takes three keyword arguments that can be integers or byte strings:
-#   true_value is the raw value for true (default 0x01),
-#   false_value is the raw value for false (default 0x00),
-#   mask is used to keep only some bits from a sequence of bits.
+# _BooleanV is for boolean values.  It takes five keyword arguments
+#   true_value is the raw value for true (default 0x01), this can be an integer or a byte string,
+#   false_value is the raw value for false (default 0x00), this can be an integer or a byte string,
+#   mask is used to keep only some bits from a sequence of bits, this can be an integer or a byte string,
+#   read_skip_byte_count is the number of bytes to ignore at the beginning of the read value (default 0),
+#   write_prefix_bytes is a byte string to write before the value (default empty).
 # _RangeV is for an integer in a range.  It takes three keyword arguments:
 #   min_value is the minimum value for the setting,
 #   max_value is the maximum value for the setting,
@@ -238,8 +243,8 @@ _DISABLE_KEYS_LABEL_SUB = _('Disables the %s key.')
 # _ChoicesV is for symbolic choices.  It takes one positional and three keyword arguments:
 #   the positional argument is a list of named integers that are the valid choices,
 #   byte_count is the number of bytes for the integer (default size of largest choice integer),
-#   read_skip_byte_count is the number of bytes to ignore at the beginning of the read value (default 0),
-#   write_prefix_bytes is a byte string to write before the value (default empty).
+#   read_skip_byte_count is as for _BooleanV,
+#   write_prefix_bytes is as for _BooleanV.
 #
 # The _Settings class is for settings that are maps from keys to values.
 # The _BitFieldSetting class is for settings that have multiple boolean values packed into a bit field.
@@ -292,7 +297,7 @@ def _feature_new_fn_swap():
 # ignore the capabilities part of the feature - all devices should be able to swap Fn state
 # just use the current host (first byte = 0xFF) part of the feature to read and set the Fn state
 def _feature_k375s_fn_swap():
-    validator = _BooleanV(true_value=b'\x01', false_value=b'\x00', read_offset=1)
+    validator = _BooleanV(true_value=b'\x01', false_value=b'\x00', read_skip_byte_count=1)
     return _Setting(_FN_SWAP, _FeatureRW(_F.K375S_FN_INVERSION, prefix=b'\xFF'), validator, device_kind=(_DK.keyboard, ))
 
 
@@ -480,7 +485,7 @@ def _feature_speed_change():
             keys = [_NamedInt(0, _('Off')), key.key]
             return _ChoicesV(_NamedInts.list(keys), byte_count=2)
 
-    rw = _SpeedChangeRW('speed change', _DIVERT_KEYS[0]),
+    rw = _SpeedChangeRW('speed change', _DIVERT_KEYS[0])
     return _Setting(_SPEED_CHANGE, rw, callback=callback, device_kind=(_DK.mouse, _DK.trackball))
 
 
@@ -654,6 +659,23 @@ def _feature_pointer_speed():
 # each choice value is a NamedInt with the string from a task (to be shown to the user)
 # and the integer being the control number for that task (to be written to the device)
 # Solaar only remaps keys (controlled by key gmask and group), not other key reprogramming
+class ReprogrammableKeysRW:
+    def __init__(self):
+        self.feature = _F.REPROG_CONTROLS_V4
+        self.kind = _FeatureRW.kind
+
+    def read(self, device, key):
+        key_index = device.keys.index(key)
+        key_struct = device.keys[key_index]
+        return b'\x00\x00' + _int2bytes(int(key_struct.mapped_to), 2)
+
+    def write(self, device, key, data_bytes):
+        key_index = device.keys.index(key)
+        key_struct = device.keys[key_index]
+        key_struct.remap(_special_keys.CONTROL[_bytes2int(data_bytes)])
+        return True
+
+
 def _feature_reprogrammable_keys_callback(device):
     choices = {}
     for k in device.keys:
@@ -662,24 +684,23 @@ def _feature_reprogrammable_keys_callback(device):
             choices[k.key] = tgts
     if not choices:
         return None
-    return _ChoicesMapV(
-        choices, key_byte_count=2, byte_count=2, read_skip_byte_count=1, write_prefix_bytes=b'\x00', extra_default=0
-    )
+    return _ChoicesMapV(choices, key_byte_count=2, byte_count=2, extra_default=0)
 
 
 def _feature_reprogrammable_keys():
-    rw = _FeatureRWMap(_F.REPROG_CONTROLS_V4, read_fnid=0x20, write_fnid=0x30, key_byte_count=2)
+    rw = ReprogrammableKeysRW()
     return _Settings(_REPROGRAMMABLE_KEYS, rw, callback=_feature_reprogrammable_keys_callback, device_kind=(_DK.keyboard, ))
 
 
 class DivertKeysRW:
     def __init__(self):
+        self.feature = _F.REPROG_CONTROLS_V4
         self.kind = _FeatureRW.kind
 
     def read(self, device, key):
         key_index = device.keys.index(key)
         key_struct = device.keys[key_index]
-        return b'0x01' if 'diverted' in key_struct.mapping_flags else b'0x00'
+        return b'\x00\x00\x01' if 'diverted' in key_struct.mapping_flags else b'\x00\x00\x00'
 
     def write(self, device, key, data_bytes):
         key_index = device.keys.index(key)
@@ -842,6 +863,12 @@ def _feature_divert_crown():
     return _Setting(_DIVERT_CROWN, rw, _BooleanV(true_value=0x02, false_value=0x01, mask=0xff), device_kind=(_DK.keyboard, ))
 
 
+def _feature_crown_smooth():
+    rw = _FeatureRW(_F.CROWN, read_fnid=0x10, write_fnid=0x20)
+    validator = _BooleanV(true_value=0x01, false_value=0x02, read_skip_byte_count=1, write_prefix_bytes=b'\x00')
+    return _Setting(_CROWN_SMOOTH, rw, validator, device_kind=(_DK.keyboard, ))
+
+
 def _feature_divert_gkeys():
     class _DivertGkeysRW(_FeatureRW):
         def __init__(self, feature):
@@ -890,6 +917,7 @@ _SETTINGS_TABLE = [
     _S(_DISABLE_KEYS, _F.KEYBOARD_DISABLE_KEYS, _feature_disable_keyboard_keys),
     _S(_REPORT_RATE, _F.REPORT_RATE, _feature_report_rate),
     _S(_DIVERT_CROWN, _F.CROWN, _feature_divert_crown),
+    _S(_CROWN_SMOOTH, _F.CROWN, _feature_crown_smooth),
     _S(_DIVERT_GKEYS, _F.GKEY, _feature_divert_gkeys),
     _S(_PLATFORM, _F.MULTIPLATFORM, _feature_multiplatform),
     _S(_PLATFORM, _F.DUALPLATFORM, _feature_dualplatform, identifier='dualplatform'),
@@ -919,12 +947,12 @@ def check_feature(device, name, featureId, featureFn):
         return
     try:
         detected = featureFn()(device)
-        if _log.isEnabledFor(_DEBUG):
-            _log.debug('check_feature[%s] detected %s', featureId, detected)
+        if _log.isEnabledFor(_INFO):
+            _log.info('check_feature %s [%s] detected %s', name, featureId, detected)
         return detected
     except Exception:
         from traceback import format_exc
-        _log.error('check_feature[%s] inconsistent feature %s', featureId, format_exc())
+        _log.error('check_feature %s [%s] error %s', name, featureId, format_exc())
 
 
 # Returns True if device was queried to find features, False otherwise
@@ -934,12 +962,22 @@ def check_feature_settings(device, already_known):
         return False
     if device.protocol and device.protocol < 2.0:
         return False
+    absent = device.persister.get('_absent', []) if device.persister else []
+    newAbsent = []
     for name, featureId, featureFn, __, __ in _SETTINGS_TABLE:
         if featureId and featureFn:
-            if not any(s.name == name for s in already_known):
+            if name not in absent and not any(s.name == name for s in already_known):
                 setting = check_feature(device, name, featureId, featureFn)
                 if setting:
                     already_known.append(setting)
+                    if name in newAbsent:
+                        newAbsent.remove(name)
+                else:
+                    if not any(s.name == name for s in already_known) and name not in newAbsent:
+                        newAbsent.append(name)
+    if device.persister and newAbsent:
+        absent.extend(newAbsent)
+        device.persister['_absent'] = absent
     return True
 
 
